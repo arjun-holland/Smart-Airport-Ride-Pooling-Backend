@@ -1,6 +1,6 @@
 # 🚖 Smart Airport Ride Pooling Backend
 
-A production-ready backend system that groups passengers into shared cabs while optimizing routing, pricing, and concurrency handling under high load.
+A production-grade backend system that intelligently groups passengers into shared airport cabs while optimizing routing, pricing, and concurrency safety under high load.
 
 ---
 
@@ -10,7 +10,7 @@ This project satisfies all functional and technical requirements specified in th
 
 ---
 
-# Functional Requirements Implementation
+# ✅ Functional Requirements Implementation
 
 | Requirement | Implementation |
 |-------------|---------------|
@@ -22,6 +22,31 @@ This project satisfies all functional and technical requirements specified in th
 | Support 10,000 concurrent users | Stateless architecture + Redis lock |
 | Handle 100 RPS | Load tested successfully |
 | Maintain latency < 300ms | Verified via Artillery |
+
+
+---
+
+# API Documentation
+
+Swagger UI available at:
+
+`http://localhost:5000/api-docs`
+
+<img width="1915" height="1079" alt="image" src="https://github.com/user-attachments/assets/69d6b975-db17-4d75-953e-9b9309b5a276" />
+
+
+Available Endpoints:
+
+| Method | Endpoint            | Description   |
+| ------ | ------------------- | ------------- |
+| POST   | /api/rides          | Create Ride   |
+| POST   | /api/cabs           | Create Cab    |
+| POST   | /api/match/:rideId  | Match Ride    |
+| POST   | /api/cancel/:rideId | Cancel Ride   |
+| GET    | /api/pools          | Get All Pools |
+
+Swagger provides interactive API documentation.
+
 
 ---
 
@@ -37,17 +62,38 @@ This project satisfies all functional and technical requirements specified in th
 
 ---
 
+# 📌 Assumptions & Design Decisions
+
+- Distance is calculated using the **Haversine formula** (great-circle approximation).
+- A **greedy pool selection** strategy is used to minimize incremental detour.
+- Route ordering is approximated using the **last drop-off heuristic** for simplicity.
+- Designed for **horizontal scalability** (stateless API + externalized DB & Redis).
+- MongoDB is assumed to run as a replica set (required for transactions).
+- Redis is assumed to be available for distributed locking (Upstash).
+
+---
+
 # 🏛️ High-Level Architecture
 ```
-          Client
-            ↓
-     Express API Layer (controllers)
-            ↓
-Service Layer (Business Logic)
-            ↓
-            ├────────► MongoDB Atlas (Persistent Storage)
-            │
-            └────────► Redis (Upstash) – Distributed Locking
+     ┌───────────────────────────────┐               
+     |           Client              |
+     └───────────────────────────────┘     
+                    ↓
+     ┌───────────────────────────────┐
+     | Express API Layer(Controllers)|
+     └───────────────────────────────┘
+                    ↓
+     ┌───────────────────────────────┐
+     | Service Layer (Business Logic)|
+     └───────────────────────────────┘    
+                    ↓
+     ┌───────────────────────────────┐
+     │ MongoDB Atlas (Persistent DB) │
+     └───────────────────────────────┘
+                    ↓
+     ┌───────────────────────────────┐
+     │ Redis (Upstash) – Lock Layer  │
+     └───────────────────────────────┘
 ```
 
 
@@ -125,12 +171,45 @@ For each incoming ride:
 
 ---
 
+# Dynamic Pricing Formula Design
+
+Each ride price is calculated using a distance-based model with pooling incentives.
+Formula : 
+
+```
+RawPrice =  BaseFare 
+            + (BaseDistanceKm × PerKmRate) 
+            + (DetourKm × DetourPenaltyRate)
+
+poolingDiscountFactor = 1 - 0.1 * (poolSize - 1);
+DiscountFactor = max(poolingDiscountFactor, 0.7)
+
+FinalPrice = RawPrice × DiscountFactor
+```
+
+- BaseFare : A fixed minimum charge applied to every ride.
+- BaseDistanceKm : The actual direct distance from source to destination.
+- PerKmRate : Cost per km.
+- DetourKm : Extra distance added due to pooling.
+- DetourPenaltyRate : Rate applied to detour kilometers.
+- RawPrice : This is the full cost before applying pooling discount.
+- poolSize : Number of passengers in the pool after assignment.
+- poolingDiscountFactor : Each additional rider gives 10% discount.
+- FinalPrice : FinalPrice is calculated per RideRequest.
+
+```
+A discount factor of 0.7 means the rider pays 70% of the raw price (30% discount).
+In pool size = 2(10% discount) and RawPrice = 160, each rider pays 144, not split the price among riders.
+```
+
+
+---
+
 
 # Low Level Design (Class Diagram + Patterns Used)
 
 <img width="1041" height="572" alt="image" src="https://github.com/user-attachments/assets/20d5fe67-7b1c-4553-8374-e0d8fd81ca2b" />
 
----
 
 ## Entity Relationships
 ### Relationship Summary
@@ -147,7 +226,6 @@ For each incoming ride:
          - Not be assigned yet (PENDING)
          - Or belong to exactly one pool (MATCHED)
 
----
 
 ### MongoDB Reference Mapping
 
@@ -157,9 +235,6 @@ For each incoming ride:
 - Cab.currentPoolId → RidePool._id
 - RidePool.members[] → RideRequest._id[]
 
-This ensures referential clarity while keeping collections decoupled.
-
----
 
 ## Design Patterns Used
 ### 1️⃣ Service Layer Pattern
@@ -189,9 +264,7 @@ This ensures referential clarity while keeping collections decoupled.
 
 To prevent concurrent modifications of the same RidePool, a distributed lock is acquired using `Upstash Redis` before any pool update.
 
-`
-const lock = await redis.set(lockKey, "locked", "EX", 5, "NX");
-`
+`const lock = await redis.set(lockKey, "locked", "EX", 5, "NX");`
 
 Lock Configuration:
 - NX → Set the key only if it does not already exist
@@ -213,7 +286,7 @@ Without locking:
 - Controller → Service → Model -> Models (Mongoose)
 - Clear separation of concerns
 
-### Stateless API Design
+### 5️⃣ Stateless API Design
 
 - No session stored in memory.
 - Every request is independent.
@@ -222,52 +295,57 @@ Without locking:
 
 ---
 
-### Dynamic Pricing Formula Design
+# 🔒 Concurrency Safety Strategy
+This system prevents race conditions using a dual-layer mechanism:
+## MongoDB Transactions
+- Ensure atomic multi-collection updates
+- Guarantee all-or-nothing execution
+- Prevent inconsistent state
 
-Each ride price is calculated using a distance-based model with pooling incentives.
-Formula : 
+
+## Redis Distributed Lock
+- Ensure atomic multi-collection updates
+- Guarantee all-or-nothing execution
+- Prevent inconsistent state
 
 ```
-RawPrice =  BaseFare 
-            + (BaseDistanceKm × PerKmRate) 
-            + (DetourKm × DetourPenaltyRate)
-
-poolingDiscountFactor = 1 - 0.1 * (poolSize - 1);
-DiscountFactor = max(poolingDiscountFactor, 0.7)
-
-FinalPrice = RawPrice × DiscountFactor
+Redis provides mutual exclusion.MongoDB provides atomicity and consistency.
+Together they ensure correctness under concurrent load.
 ```
-
-- BaseFare : A fixed minimum charge applied to every ride.
-- BaseDistanceKm : The actual direct distance from source to destination.
-- PerKmRate : Cost charged per kilometer of direct travel.
-- DetourKm : Extra distance added due to pooling.
-- DetourPenaltyRate : Rate applied to detour kilometers.
-- RawPrice : This is the full cost before applying pooling discount.
-- poolSize : Number of passengers in the pool after assignment.
-- poolingDiscountFactor : Each additional rider gives 10% discount.
-- FinalPrice : FinalPrice is calculated per RideRequest.
-
-Multiplier = 0.7 means: (7/10 ==> 10/100) You pay `70 %` of RawPrice, Which equals: `30 %` discount
-
-| Pool Size | poolingDiscountFactor Formula | DiscountFactor (After Cap) | Discount %   | Final Price Calculation | Final Price |
-| --------- | ----------------------------- | -------------------------- | ------------ | ----------------------- | ----------- |
-| 1         | 1 - 0.1 × (1 - 1) = 1.0       | max(1.0, 0.7) = 1.0        | 0%           | 160 × 1.0               | **160**     |
-| 2         | 1 - 0.1 × (2 - 1) = 0.9       | max(0.9, 0.7) = 0.9        | 10%          | 160 × 0.9               | **144**     |
-| 3         | 1 - 0.1 × (3 - 1) = 0.8       | max(0.8, 0.7) = 0.8        | 20%          | 160 × 0.8               | **128**     |
-| 4         | 1 - 0.1 × (4 - 1) = 0.7       | max(0.7, 0.7) = 0.7        | 30%          | 160 × 0.7               | **112**     |
-| 5         | 1 - 0.1 × (5 - 1) = 0.6       | max(0.6, 0.7) = 0.7        | 30% (capped) | 160 × 0.7               | **112**     |
-
-In pool size 2, each rider pays 144, not split the price among riders.
-
 
 ---
+
+#  Project Structure
+```
+Smart-Airport-Ride-Pooling-Backend/
+│
+├── src/
+│   ├── config/              # Database & Redis configuration
+│   ├── controllers/         # HTTP request handlers
+│   ├── models/              # Mongoose schemas (Cab, RidePool, RideRequest)
+│   ├── routes/              # Express route definitions
+│   ├── services/            # Business logic (matching, pricing, cancellation)
+│   ├── utils/               # Utility helpers (distance calculation, etc.)
+│   ├── app.ts               # Express app configuration
+│   ├── server.ts            # Application entry point
+│   └── seed.ts              # Database seed script
+│
+├── load-test.yml            # Artillery load test configuration
+├── .env.example             # Environment variables template
+├── .gitignore
+├── package.json
+├── package-lock.json
+├── tsconfig.json
+└── README.md
+```
+
+---
+
 
 # Performance Validation
 ## Load Testing Tool
 Artillery
 ### Test Configuration
-
 
 - 100 requests/second
 - 50 seconds duration
@@ -292,26 +370,77 @@ Artillery
 
 ---
 
-# API Documentation
+# 🧪 Sample Test Data
 
-Swagger UI available at:
+### Seeded Data
 
-`http://localhost:5000/api-docs`
+Run: `npm run seed`
 
-<img width="1915" height="1079" alt="image" src="https://github.com/user-attachments/assets/69d6b975-db17-4d75-953e-9b9309b5a276" />
+This will:
+- Insert sample cabs
+- Reset collections
+- Prepare environment for ride matching
 
+### Create a Ride
 
-Available Endpoints:
+`POST /api/rides`
+```
+{
+  "passengerName": "Mallikarjuna",
+  "passengerPhone": "7075733507",
+  "source": { "lat": 12.9716, "lng": 77.5946 },
+  "destination": { "lat": 13.0358, "lng": 77.5970 },
+  "luggageCount": 1,
+  "seatRequired": 1,
+  "detourToleranceKm": 5
+}
+```
+Expected Response (201):
+```
+{
+  "_id": "rideIdHere",
+  "status": "PENDING",
+  "price": 0
+}
+```
 
-| Method | Endpoint            | Description   |
-| ------ | ------------------- | ------------- |
-| POST   | /api/rides          | Create Ride   |
-| POST   | /api/cabs           | Create Cab    |
-| POST   | /api/match/:rideId  | Match Ride    |
-| POST   | /api/cancel/:rideId | Cancel Ride   |
-| GET    | /api/pools          | Get All Pools |
+### Match Ride
 
-Swagger provides interactive API documentation.
+`POST /api/match/{rideId}`
+```
+{
+  "_id": "poolId",
+  "cabId": "...",
+  "members": ["rideIdHere"],
+  "totalSeatsUsed": 1,
+  "status": "ACTIVE"
+}
+```
+
+### Get Pools
+
+`GET /api/pools`
+
+```
+[
+  {
+    "_id": "poolId",
+    "cabId": {...},
+    "members": [...],
+    "status": "ACTIVE"
+  }
+]
+```
+
+### Cancel Ride
+
+`POST /api/cancel/{rideId}`
+```
+{
+  "message": "Ride cancelled successfully"
+}
+```
+
 
 ---
 
@@ -357,6 +486,7 @@ Server will start at: `http://localhost:5000`
 Swagger API Docs available at: `http://localhost:5000/api-docs`
 
 
+
 ## 6️⃣ Run Load Test
 
 `npm run load`
@@ -374,38 +504,6 @@ This executes Artillery with:
 
 ---
 
-#  Project Structure
-```
-Smart-Airport-Ride-Pooling-Backend/
-│
-├── src/
-│   ├── config/              # Database & Redis configuration
-│   ├── controllers/         # HTTP request handlers
-│   ├── models/              # Mongoose schemas (Cab, RidePool, RideRequest)
-│   ├── routes/              # Express route definitions
-│   ├── services/            # Business logic (matching, pricing, cancellation)
-│   ├── utils/               # Utility helpers (distance calculation, etc.)
-│   ├── app.ts               # Express app configuration
-│   ├── server.ts            # Application entry point
-│   └── seed.ts              # Database seed script
-│
-├── load-test.yml            # Artillery load test configuration
-├── .env.example             # Environment variables template
-├── .gitignore
-├── package.json
-├── package-lock.json
-├── tsconfig.json
-└── README.md
-```
-
-# 📌 Assumptions & Design Decisions
-
-- Distance is calculated using the **Haversine formula** (great-circle approximation).
-- A **greedy pool selection** strategy is used to minimize incremental detour.
-- Route ordering is approximated using the **last drop-off heuristic** for simplicity.
-- Designed for **horizontal scalability** (stateless API + externalized DB & Redis).
-- MongoDB is assumed to run as a replica set (required for transactions).
-- Redis is assumed to be available for distributed locking (Upstash).
 
 # 🏁 Conclusion
 This backend system delivers:
