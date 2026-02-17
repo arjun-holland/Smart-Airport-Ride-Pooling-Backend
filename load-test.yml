@@ -1,0 +1,44 @@
+config:
+  target: "http://localhost:5000"
+  phases:
+    - duration: 50
+      arrivalRate: 100
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  - name: Create Ride Load Test
+    flow:
+      - post:
+          url: "/api/rides"
+          json:
+            passengerName: "LoadUser"
+            passengerPhone: "9999999999"
+            source:
+              lat: 17.385
+              lng: 78.4867
+            destination:
+              lat: 17.450
+              lng: 78.380
+            luggageCount: 1
+            seatRequired: 1
+            detourToleranceKm: 5
+
+
+
+
+# config:
+#   target: "http://localhost:5000"
+#   phases:
+#     - duration: 30
+#       arrivalRate: 50   # Start with 50 RPS
+#   defaults:
+#     headers:
+#       Content-Type: "application/json"
+
+# scenarios:
+#   - name: Create Ride Load Test
+#     flow:
+#       - get:                  
+#           url: "/api/pools"  ## ADMIN SEEING ALL OVER THE POOL
